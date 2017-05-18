@@ -188,6 +188,12 @@ def _copyfileobj_readinto(fsrc, fdst, length=COPY_BUFSIZE):
             else:
                 fdst_write(mv)
 
+
+class FileReplacedError(OSError):
+    """Raised when a file being copied is modified between the initial
+    call to stat() and the file actually being opened and copied"""
+
+
 def copyfileobj(fsrc, fdst, length=COPY_BUFSIZE):
     """copy data from file-like object fsrc to file-like object fdst"""
     # Localize variable access to minimize overhead.
@@ -222,9 +228,13 @@ def copyfile(src, dst, *, follow_symlinks=True):
         raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
 
     file_size = 0
+    inodes_pre = []
     for i, fn in enumerate([src, dst]):
         try:
             st = os.stat(fn)
+            # Preserve inode number to confirm has not changed between
+            # here and the call to open() below
+            inodes_pre.append(st.st_ino)
         except OSError:
             # File most likely does not exist
             pass
@@ -239,6 +249,15 @@ def copyfile(src, dst, *, follow_symlinks=True):
         os.symlink(os.readlink(src), dst)
     else:
         with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
+            st = os.fstat(fsrc.fileno())
+            inode_post = st.st_ino
+            # Confirm that inode has not changed at this point
+            # This test will always pass in Windows Python 2.7
+            # because st_ino is always 0.
+            # It will pass in Windows Python 3.X  because
+            # st_ino is populated with meaningful data.
+            if inodes_pre[0] != inode_post:
+                raise FileReplacedError("`%s` was replaced in the middle of copying" % src)
             # macOS
             if _HAS_FCOPYFILE:
                 try:
@@ -260,7 +279,6 @@ def copyfile(src, dst, *, follow_symlinks=True):
                 return dst
 
             copyfileobj(fsrc, fdst)
-
     return dst
 
 def copymode(src, dst, *, follow_symlinks=True):
