@@ -5,6 +5,7 @@ XXX The functions here don't copy the resource fork or other metadata on Mac.
 """
 
 import os
+import fcntl
 import sys
 import stat
 import fnmatch
@@ -188,12 +189,6 @@ def _copyfileobj_readinto(fsrc, fdst, length=COPY_BUFSIZE):
             else:
                 fdst_write(mv)
 
-
-class FileReplacedError(OSError):
-    """Raised when a file being copied is modified between the initial
-    call to stat() and the file actually being opened and copied"""
-
-
 def copyfileobj(fsrc, fdst, length=COPY_BUFSIZE):
     """copy data from file-like object fsrc to file-like object fdst"""
     # Localize variable access to minimize overhead.
@@ -217,6 +212,11 @@ def _samefile(src, dst):
     return (os.path.normcase(os.path.abspath(src)) ==
             os.path.normcase(os.path.abspath(dst)))
 
+def _samefilef(fsrc, fdst):
+    if os.path.abspath(fsrc.name) == os.path.abspath(fdst.name):
+        return True
+    return False
+
 def copyfile(src, dst, *, follow_symlinks=True):
     """Copy data from src to dst in the most efficient way possible.
 
@@ -224,17 +224,22 @@ def copyfile(src, dst, *, follow_symlinks=True):
     symlink will be created instead of copying the file it points to.
 
     """
-    if _samefile(src, dst):
-        raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
+    # In Unix, we must open the files non-blocking initially as opening a
+    # FIFO without data present in it will block.
+    if os.name != 'nt':
+        src_flags = os.O_RDONLY | os.O_NONBLOCK
+        dst_flags = os.O_WRONLY | os.O_NONBLOCK
+    else:
+        src_flags = os.O_RDONLY
+        dst_flags = os.O_WRONLY
+    fsrc = os.open(src, src_flags)
+    fdst = os.open(src, dst_flags)
 
     file_size = 0
     inodes_pre = []
-    for i, fn in enumerate([src, dst]):
+    for i, fn in enumerate([fsrc, fdst]):
         try:
-            st = os.stat(fn)
-            # Preserve inode number to confirm has not changed between
-            # here and the call to open() below
-            inodes_pre.append(st.st_ino)
+            st = os.fstat(fn)
         except OSError:
             # File most likely does not exist
             pass
@@ -245,40 +250,49 @@ def copyfile(src, dst, *, follow_symlinks=True):
             if _WINDOWS and i == 0:
                 file_size = st.st_size
 
+    # In Unix, we must set the file descriptors back to blocking as that's
+    # what the rest of this function expects.
+    # Additonally, fsrc, and fdst must be turned into file objects
+    if os.name != 'nt':
+        srcfl = fcntl.fcntl(fsrc, fcntl.F_GETFL)
+        dstfl = fcntl.fcntl(fdst, fcntl.F_GETFL)
+
+        # Unset the non-blocking flag
+        fcntl.fcntl(fsrc, fcntl.F_SETFL, srcfl & ~os.O_NONBLOCK)
+        fcntl.fcntl(fdst, fcntl.F_SETFL, dstfl & ~os.O_NONBLOCK)
+
+        # Turn fsrc and fdst into file objects
+        fsrc = os.fdopen(fsrc, "r")
+        fdst = os.fdopen(fdst, "w")
+
+    if _samefilef(fsrc, fdst):
+        raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
+
+    # XXX Is there a race issue here with os.path.islink() operating on a
+    # path rather than a file descriptor
     if not follow_symlinks and os.path.islink(src):
         os.symlink(os.readlink(src), dst)
     else:
-        with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
-            st = os.fstat(fsrc.fileno())
-            inode_post = st.st_ino
-            # Confirm that inode has not changed at this point
-            # This test will always pass in Windows Python 2.7
-            # because st_ino is always 0.
-            # It will pass in Windows Python 3.X  because
-            # st_ino is populated with meaningful data.
-            if inodes_pre[0] != inode_post:
-                raise FileReplacedError("`%s` was replaced in the middle of copying" % src)
-            # macOS
-            if _HAS_FCOPYFILE:
-                try:
-                    _fastcopy_fcopyfile(fsrc, fdst, posix._COPYFILE_DATA)
-                    return dst
-                except _GiveupOnFastCopy:
-                    pass
-            # Linux / Solaris
-            elif _HAS_SENDFILE:
-                try:
-                    _fastcopy_sendfile(fsrc, fdst)
-                    return dst
-                except _GiveupOnFastCopy:
-                    pass
-            # Windows, see:
-            # https://github.com/python/cpython/pull/7160#discussion_r195405230
-            elif _WINDOWS and file_size > 0:
-                _copyfileobj_readinto(fsrc, fdst, min(file_size, COPY_BUFSIZE))
+        # macOS
+        if _HAS_FCOPYFILE:
+            try:
+                _fastcopy_fcopyfile(fsrc, fdst, posix._COPYFILE_DATA)
                 return dst
-
-            copyfileobj(fsrc, fdst)
+            except _GiveupOnFastCopy:
+                pass
+        # Linux / Solaris
+        elif _HAS_SENDFILE:
+            try:
+                _fastcopy_sendfile(fsrc, fdst)
+                return dst
+            except _GiveupOnFastCopy:
+                pass
+        # Windows, see:
+        # https://github.com/python/cpython/pull/7160#discussion_r195405230
+        elif _WINDOWS and file_size > 0:
+            _copyfileobj_readinto(fsrc, fdst, min(file_size, COPY_BUFSIZE))
+            return dst
+        copyfileobj(fsrc, fdst)
     return dst
 
 def copymode(src, dst, *, follow_symlinks=True):

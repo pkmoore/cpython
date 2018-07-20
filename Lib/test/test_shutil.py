@@ -21,7 +21,7 @@ from shutil import (make_archive,
                     get_archive_formats, Error, unpack_archive,
                     register_unpack_format, RegistryError,
                     unregister_unpack_format, get_unpack_formats,
-                    SameFileError, _GiveupOnFastCopy, FileReplacedError)
+                    SameFileError, _GiveupOnFastCopy)
 import tarfile
 import zipfile
 try:
@@ -1460,37 +1460,6 @@ class TestShutil(unittest.TestCase):
         self.assertRaises(Error, shutil.copyfile, src_file, src_file)
         # Make sure file is not corrupted.
         self.assertEqual(read_file(src_file), 'foo')
-
-    def test_copyfile_file_replaced(self):
-        # copyfile() should raise FileReplacedError if the source file is
-        # replaced between the time when it is initially stat()ed and when the
-        # copy operation takes place.
-        src_dir = self.mkdtemp()
-        dst_dir = self.mkdtemp()
-        src_file = os.path.join(src_dir, 'foo')
-        dst_file = os.path.join(dst_dir, 'bar')
-        write_file(src_file, 'foo')
-
-        real_stat = os.stat(os.path.join(src_dir, 'foo'))
-        stat_mock = unittest.mock.Mock()
-        stat_mock.st_dev = 1
-        stat_mock.st_ino = 5555
-        stat_mock.st_mode = real_stat.st_mode
-        fstat_mock = unittest.mock.Mock()
-        fstat_mock.st_dev = 2
-        fstat_mock.st_ino = 6666
-        fstat_mock.st_mode = real_stat.st_mode
-        with unittest.mock.patch('shutil._samefile', return_value=False) as s:
-            with unittest.mock.patch('os.stat', return_value=stat_mock) as ms:
-                with unittest.mock.patch('os.fstat',
-                                         return_value=fstat_mock) as mf:
-                    self.assertRaises(FileReplacedError,
-                                      shutil.copyfile,
-                                      src_file,
-                                      dst_file)
-        s.assert_called()
-        ms.assert_called()
-        mf.assert_called()
 
     def test_copytree_return_value(self):
         # copytree returns its destination path.
