@@ -224,55 +224,88 @@ def copyfile(src, dst, *, follow_symlinks=True):
     symlink will be created instead of copying the file it points to.
 
     """
-    # In Unix, we must open the files non-blocking initially as opening a
-    # FIFO without data present in it will block.
-    if os.name != 'nt':
-        src_flags = os.O_RDONLY | os.O_NONBLOCK
-        dst_flags = os.O_WRONLY | os.O_NONBLOCK
-    else:
-        src_flags = os.O_RDONLY
-        dst_flags = os.O_WRONLY
-    fsrc = os.open(src, src_flags)
-    fdst = os.open(src, dst_flags)
 
-    file_size = 0
-    inodes_pre = []
-    for i, fn in enumerate([fsrc, fdst]):
-        try:
-            st = os.fstat(fn)
-        except OSError:
-            # File most likely does not exist
-            pass
-        else:
-            # XXX What about other special files? (sockets, devices...)
-            if stat.S_ISFIFO(st.st_mode):
-                raise SpecialFileError("`%s` is a named pipe" % fn)
-            if _WINDOWS and i == 0:
-                file_size = st.st_size
-
-    # In Unix, we must set the file descriptors back to blocking as that's
-    # what the rest of this function expects.
-    # Additonally, fsrc, and fdst must be turned into file objects
-    if os.name != 'nt':
-        srcfl = fcntl.fcntl(fsrc, fcntl.F_GETFL)
-        dstfl = fcntl.fcntl(fdst, fcntl.F_GETFL)
-
-        # Unset the non-blocking flag
-        fcntl.fcntl(fsrc, fcntl.F_SETFL, srcfl & ~os.O_NONBLOCK)
-        fcntl.fcntl(fdst, fcntl.F_SETFL, dstfl & ~os.O_NONBLOCK)
-
-        # Turn fsrc and fdst into file objects
-        fsrc = os.fdopen(fsrc, "r")
-        fdst = os.fdopen(fdst, "w")
-
-    if _samefilef(fsrc, fdst):
+    if _samefile(src, dst):
         raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
 
     # XXX Is there a race issue here with os.path.islink() operating on a
     # path rather than a file descriptor
     if not follow_symlinks and os.path.islink(src):
         os.symlink(os.readlink(src), dst)
+        return dst
+
+    # In Unix, we must open the files non-blocking initially as opening a
+    # FIFO without data present in it will block.
+    if os.name != 'nt':
+        src_flags = os.O_RDONLY | os.O_NONBLOCK
+        dst_flags = os.O_CREAT | os.O_WRONLY | os.O_NONBLOCK
     else:
+        src_flags = os.O_RDONLY
+        dst_flags = os.O_WRONLY
+
+    def _src_opener(path, flags):
+        return os.open(path, src_flags)
+
+    # dst's opener is more complex.  We need to atomically check and open the
+    # destination if it doesn't exist.  If it does exist, we need to detect so
+    # we don't destroy it later should we have to fail out for some reason.
+    dst_was_created = False
+    def _dst_opener(path, flags):
+        nonlocal dst_was_created
+        try:
+            dst_was_created = True
+            return os.open(path, dst_flags | os.O_EXCL)
+        except FileExistsError:
+            dst_was_created = False
+            try :
+                # Open the already existing file in as non-blocking
+                fd = os.open(path, dst_flags)
+            # If the destination is already a FIFO for some reason, we'll get an
+            # OSError here as we've opened a FIFO for a non-blocking write with
+            # no reader on the other end.
+            except OSError as e:
+                # Use errno to decide whether the OSError we caught is due to
+                # the above reason or some other reason.  For the above reason,
+                # raise the appropriate special file error.  Otherwise, we need
+                # to re-raise the OSError
+                if e.errno == errno.ENXIO:
+                    raise SpecialFileError("`%s` is a named pipe" % path)
+                else:
+                    raise e
+            # This check is required to catch the case where the destination
+            # file is a FIFO that's we successfully opened non-blocking because
+            # for some reason there was a reader listening preventing an ENXIO
+            # situation.
+            st = os.fstat(fd)
+            if stat.S_ISFIFO(st.st_mode):
+                raise SpecialFileError("`%s` is a named pipe" % path)
+            return fd
+
+    with open(src, 'r', opener=_src_opener) as fsrc, open(dst, 'w', opener=_dst_opener) as fdst:
+        file_size = 0
+        inodes_pre = []
+        # file.name is not populated when using os.fdopen()
+        st = os.fstat(fsrc.fileno())
+        if stat.S_ISFIFO(st.st_mode):
+            # Don't unlink dst unless we created it above
+            if dst_was_created:
+                os.unlink(dst)
+            raise SpecialFileError("`%s` is a named pipe" % src)
+        if _WINDOWS and i == 0:
+            file_size = st.st_size
+
+        # In Unix, we must set the file descriptors back to blocking as that's
+        # what the rest of this function expects.
+        # Additonally, fsrc, and fdst must be turned into file objects
+        if os.name != 'nt':
+            srcfl = fcntl.fcntl(fsrc.fileno(), fcntl.F_GETFL)
+            dstfl = fcntl.fcntl(fdst.fileno(), fcntl.F_GETFL)
+
+            # Unset the non-blocking flag
+            fcntl.fcntl(fsrc.fileno(), fcntl.F_SETFL, srcfl & ~os.O_NONBLOCK)
+            fcntl.fcntl(fdst.fileno(), fcntl.F_SETFL, dstfl & ~os.O_NONBLOCK)
+
+
         # macOS
         if _HAS_FCOPYFILE:
             try:
@@ -293,7 +326,7 @@ def copyfile(src, dst, *, follow_symlinks=True):
             _copyfileobj_readinto(fsrc, fdst, min(file_size, COPY_BUFSIZE))
             return dst
         copyfileobj(fsrc, fdst)
-    return dst
+        return dst
 
 def copymode(src, dst, *, follow_symlinks=True):
     """Copy mode bits from src to dst.
